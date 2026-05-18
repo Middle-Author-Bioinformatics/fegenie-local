@@ -447,17 +447,36 @@ def maybe_generate_report(args, job_root: Path, out_dir: Path, report_dest: Path
         shutil.copy2(existing, report_dest)
         return
 
+    candidate_report_scripts = []
     if args.report_script:
-        script = Path(args.report_script)
+        candidate_report_scripts.append(Path(args.report_script))
+    # Preferred: keep the original Plotly report generator beside this worker.
+    # This lets the worker package remain portable without hard-coding the old
+    # HoundSleuth location.
+    candidate_report_scripts.append(Path(__file__).resolve().parent / "fegenie_report.py")
+    candidate_report_scripts.append(Path.cwd() / "fegenie_report.py")
+    candidate_report_scripts.append(Path("/home/ark/MAB/bin/HoundSleuth/fegenie_report.py"))
+
+    seen_scripts: set[Path] = set()
+    for script in candidate_report_scripts:
+        script = script.expanduser().resolve()
+        if script in seen_scripts:
+            continue
+        seen_scripts.add(script)
         if script.exists():
+            logging.info("Generating Plotly FeGenie report with: %s", script)
             cmd: list[str] = []
             if args.command_prefix:
                 cmd.extend(args.command_prefix.split())
-            cmd.extend([str(script), "-o", str(report_dest), str(heatmap_csv)])
+            # Original fegenie_report.py interface:
+            #   python fegenie_report.py FeGenie-heatmap-data.csv -o report.html
+            cmd.extend(["python", str(script), str(heatmap_csv), "-o", str(report_dest)])
             run_command(cmd, log_handle)
             if report_dest.exists():
+                logging.info("Generated Plotly report: %s", report_dest)
                 return
 
+    logging.warning("No Plotly report generator found; writing fallback report instead.")
     write_fallback_report(report_dest, manifest, heatmap_csv, gene_csv)
 
 
