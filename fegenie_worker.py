@@ -334,6 +334,14 @@ def first_existing(out_dir: Path, names: Iterable[str]) -> Path | None:
     return None
 
 
+def first_existing_recursive(out_dir: Path, names: Iterable[str]) -> Path | None:
+    wanted = {name.lower() for name in names}
+    for path in out_dir.rglob("*"):
+        if path.is_file() and path.name.lower() in wanted:
+            return path
+    return None
+
+
 def normalize_gene_summary(src: Path, dest: Path) -> None:
     """Remove duplicate header rows and ensure frontend-required columns are present."""
     with src.open("r", newline="", encoding="utf-8", errors="replace") as inp:
@@ -423,9 +431,19 @@ def write_fallback_report(dest: Path, manifest: JobManifest, heatmap_csv: Path, 
     )
 
 
-def maybe_generate_report(args, out_dir: Path, report_dest: Path, manifest: JobManifest, heatmap_csv: Path, gene_csv: Path, log_handle) -> None:
-    existing = first_existing(out_dir, ["fegenie-report.html", "FeGenie-report.html", "FeGenie_Report.html"])
+def maybe_generate_report(args, job_root: Path, out_dir: Path, report_dest: Path, manifest: JobManifest, heatmap_csv: Path, gene_csv: Path, log_handle) -> None:
+    existing = first_existing_recursive(
+        job_root,
+        [
+            "fegenie-report.html",
+            "FeGenie-report.html",
+            "FeGenie_Report.html",
+            "FeGenie-report-3.html",
+            "report.html",
+        ],
+    )
     if existing:
+        logging.info("Using FeGenie HTML report: %s", existing)
         shutil.copy2(existing, report_dest)
         return
 
@@ -532,7 +550,7 @@ def process_job(args, s3, prefix: str) -> None:
             report_dest = final_dir / "fegenie-report.html"
             normalize_heatmap(heatmap_src, heatmap_dest)
             normalize_gene_summary(gene_src, gene_dest)
-            maybe_generate_report(args, out_dir, report_dest, manifest, heatmap_dest, gene_dest, log_handle)
+            maybe_generate_report(args, job_root, out_dir, report_dest, manifest, heatmap_dest, gene_dest, log_handle)
 
         tar_path = job_root / "raw-results.tar.gz"
         make_tarball(out_dir, tar_path)
