@@ -1,7 +1,8 @@
 """Run legacy FeGenie in its conda environment with explicit resource paths.
 
 Only the worker's disposable bins/ copies are prepared. Uploaded input/ files
-are retained verbatim, and missing protein translations are never inferred.
+are retained verbatim. Missing translations can be recovered from validated,
+annotated CDS; gene prediction is never rerun.
 """
 from __future__ import annotations
 
@@ -54,8 +55,51 @@ def check_genbank_dependencies():
         raise RuntimeError('Missing Biopython in the FeGenie execution environment.') from error
 
 
+def qualifier(feature, name, default=''):
+    values = feature.qualifiers.get(name, [])
+    return values[0] if values else default
+
+
+def recover_translation(record, feature):
+    """Translate a complete, ordinary annotated CDS, or explain its exclusion."""
+    from Bio.Data.CodonTable import TranslationError
+    from Bio.SeqFeature import ExactPosition
+
+    if 'pseudo' in feature.qualifiers or 'pseudogene' in feature.qualifiers:
+        return None, 'pseudogene'
+    if 'transl_except' in feature.qualifiers or 'exception' in feature.qualifiers:
+        return None, 'translation_exception'
+    note = str(qualifier(feature, 'note')).lower()
+    if any(term in note for term in ['frameshifted', 'internal stop', 'incomplete']):
+        return None, 'noted_incomplete_or_disrupted'
+    location = feature.location
+    if location is None:
+        return None, 'missing_location'
+    # The existing GToTree converter excludes joins and fuzzy/partial calls.
+    if len(location.parts) != 1 or location.ref is not None:
+        return None, 'compound_or_remote_location'
+    if not isinstance(location.start, ExactPosition) or not isinstance(location.end, ExactPosition):
+        return None, 'partial_or_uncertain_location'
+    if location.strand not in (1, -1):
+        return None, 'unknown_strand'
+    if not 0 <= int(location.start) < int(location.end) <= len(record.seq):
+        return None, 'location_outside_sequence'
+    try:
+        nucleotides = str(feature.extract(record.seq)).upper()
+        if not nucleotides or set(nucleotides) - set('ACGT'):
+            return None, 'missing_or_ambiguous_nucleotides'
+        # SeqFeature.translate respects strand, codon_start and transl_table.
+        # GenBank's documented default when transl_table is absent is table 1.
+        protein = str(feature.translate(record.seq, table=1, cds=True))
+    except (ValueError, TranslationError, TypeError, KeyError) as error:
+        return None, 'invalid_cds: ' + str(error)
+    if not protein:
+        return None, 'empty_translation'
+    return protein, ''
+
+
 def prepare_genbank(bins_dir, extension, output_dir):
-    """Exclude CDS without /translation from run copies; document every exclusion.
+    """Recover valid missing CDS translations in run copies and report changes.
 
     Other features and supplied translations are preserved. Upstream GToTree's
     remaining protein filters (partial calls, pseudogenes, etc.) still apply.
@@ -64,6 +108,20 @@ def prepare_genbank(bins_dir, extension, output_dir):
 
     fields = ['genome', 'contig', 'locus_tag', 'protein_id', 'location', 'reason']
     exclusions = []
+    recoveries = []
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_reports():
+        for name, columns, rows in [
+            ('genbank-exclusions.csv', fields, exclusions),
+            ('genbank-translations.csv', fields[:-1] + [
+                'translation_table', 'codon_start', 'protein_length', 'source'], recoveries),
+        ]:
+            with (output_dir / name).open('w', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(rows)
     files = sorted(Path(bins_dir).glob(f'*.{extension}'))
     if not files:
         raise RuntimeError('No GenBank files found for the configured extension.')
@@ -72,42 +130,49 @@ def prepare_genbank(bins_dir, extension, output_dir):
             records = list(SeqIO.parse(handle, 'genbank'))
         if not records:
             raise RuntimeError(f'No GenBank records found in {path.name}.')
-        missing = 0
-        translated = 0
+        excluded = 0
+        supplied = 0
+        recovered = 0
         for record in records:
             kept = []
             for feature in record.features:
                 translation = feature.qualifiers.get('translation', [])
                 if feature.type == 'CDS' and not (translation and str(translation[0]).strip()):
-                    exclusions.append({
+                    row = {
                         'genome': path.name, 'contig': record.name,
-                        'locus_tag': feature.qualifiers.get('locus_tag', [''])[0],
-                        'protein_id': feature.qualifiers.get('protein_id', [''])[0],
-                        'location': str(feature.location), 'reason': 'missing_translation',
-                    })
-                    missing += 1
-                    continue
-                if feature.type == 'CDS':
-                    translated += 1
+                        'locus_tag': qualifier(feature, 'locus_tag'),
+                        'protein_id': qualifier(feature, 'protein_id'),
+                        'location': str(feature.location),
+                    }
+                    protein, reason = recover_translation(record, feature)
+                    if protein is None:
+                        exclusions.append(dict(row, reason=reason))
+                        excluded += 1
+                        continue
+                    feature.qualifiers['translation'] = [protein]
+                    recoveries.append(dict(row,
+                        translation_table=qualifier(feature, 'transl_table', '1'),
+                        codon_start=qualifier(feature, 'codon_start', '1'),
+                        protein_length=len(protein), source='annotated_CDS_translation'))
+                    recovered += 1
+                elif feature.type == 'CDS':
+                    supplied += 1
                 kept.append(feature)
             record.features = kept
-        print(f'{path.name}: {translated} CDS with supplied translations; '
-              f'{missing} CDS excluded for missing translation.', flush=True)
-        if not translated:
-            raise RuntimeError(f'{path.name} has no CDS with supplied protein translations.')
-        if missing:
+        print(f'{path.name}: {supplied} supplied CDS translations; '
+              f'{recovered} recovered from annotated DNA; {excluded} CDS excluded.', flush=True)
+        # Keep QC reports available even when a genome has no usable proteins.
+        write_reports()
+        if not supplied + recovered:
+            raise RuntimeError(f'{path.name} has no usable CDS translations. '
+                               'See genbank-exclusions.csv for reasons.')
+        if excluded or recovered:
             temporary = path.with_name(path.name + '.tmp')
             try:
                 SeqIO.write(records, temporary, 'genbank')
                 temporary.replace(path)
             finally:
                 temporary.unlink(missing_ok=True)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / 'genbank-exclusions.csv').open('w', newline='', encoding='utf-8') as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(exclusions)
     return exclusions
 
 
@@ -155,3 +220,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     sys.exit(main())
+
