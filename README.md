@@ -28,9 +28,13 @@ The worker runs `fegenie_runtime.py` **inside** the selected conda environment. 
 
 For a different resource layout, pass `--hmm-dir /path/to/hmms/iron --rscripts-dir /path/to/rscripts` to the worker/wrapper, or set `FEGENIE_HMM_DIR` and `FEGENIE_RSCRIPT_DIR`. Explicit invalid paths fail instead of silently selecting another library. FeGenie runs in the private job directory, isolating its temporary path-discovery files.
 
-Some valid GenBank CDS annotations lack `/translation`. The upstream GToTree converter raises `KeyError: 'translation'` for these. Before calling FeGenie, the runtime removes only such CDS features from the disposable `bins/` copies, preserving all supplied protein translations and other features. It does **not** infer proteins, rerun gene prediction, or modify the original `input/` uploads. The converter's other existing filters still apply. A file with no supplied CDS translations fails explicitly.
+Some GenBank exports have CDS coordinates and nucleotide sequences but omit `/translation`, sometimes for every CDS in a genome. The upstream GToTree converter raises `KeyError: 'translation'` for these. Before calling FeGenie, the runtime recovers missing translations from complete annotated CDS in the disposable `bins/` copies. It respects strand, `/codon_start`, and `/transl_table`, using GenBank's standard-code default (table 1) if no table is supplied. Strict CDS validation requires a valid start, a terminal stop, a whole number of codons and no internal stops. No gene prediction is rerun, existing supplied protein translations are preserved, and original `input/` uploads are unchanged.
 
-Every excluded CDS is recorded with its genome, contig, locus tag, protein ID, location and reason in `genbank-exclusions.csv`, included in the downloadable `raw-results.tar.gz`. Exclusion counts also appear in the local run log. A successfully processed genome can therefore have fewer analyzed CDS than annotated CDS.
+Missing translations are not recovered for pseudogenes, translation exceptions, partial/uncertain or compound/remote locations, ambiguous/missing nucleotide sequences, or invalid CDS. These features are excluded from the run copy and recorded with a reason in `genbank-exclusions.csv`. A genome with no supplied or recoverable proteins still fails explicitly; its exclusion report is retained locally. The converter's other existing filters continue to apply.
+
+Recovered translations are recorded in `genbank-translations.csv` with genome, contig, locus tag, protein ID, location, genetic code, codon offset and protein length. Both CSV files are included in the downloadable `raw-results.tar.gz`. The local run log gives supplied/recovered/excluded counts per genome. A successfully processed genome can therefore have fewer analyzed CDS than annotated CDS.
+
+Translation rules follow the [Biopython SeqFeature API](https://biopython.org/docs/latest/api/Bio.SeqFeature.html) and [NCBI genetic-code conventions](https://www.ncbi.nlm.nih.gov/datasets/docs/v2/data-processing/taxonomy-processing/genetic-codes/).
 
 ## Recover Rebecca's failed job
 
@@ -62,4 +66,5 @@ python -m unittest discover -s tests -v
 ```
 
 Tests use local GenBank/resource fixtures, a subprocess extraction fixture and mocked S3/analysis commands; they do not run HMM analyses or send notifications.
+
 

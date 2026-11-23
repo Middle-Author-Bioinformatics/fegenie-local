@@ -63,7 +63,8 @@ class RuntimeTests(unittest.TestCase):
             with (root / 'out/genbank-exclusions.csv').open() as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 2)
-            self.assertTrue(all(row['reason'] == 'missing_translation' for row in rows))
+            self.assertTrue(rows[0]['reason'].startswith('invalid_cds:'))
+            self.assertEqual(rows[1]['reason'], 'pseudogene')
             self.assertNotIn(str(root), json.dumps(rows))
 
     def test_no_translations_fails_without_inventing_proteins_or_rewriting_input(self):
@@ -71,7 +72,7 @@ class RuntimeTests(unittest.TestCase):
             root = Path(tmp); bins = root / 'bins'; bins.mkdir()
             genome = bins / 'sample.gbk'; write_genbank(genome, translated=False)
             original = genome.read_bytes()
-            with self.assertRaisesRegex(RuntimeError, 'no CDS with supplied'):
+            with self.assertRaisesRegex(RuntimeError, 'no usable CDS translations'):
                 runtime.prepare_genbank(bins, 'gbk', root / 'out')
             self.assertEqual(genome.read_bytes(), original)
 
@@ -176,3 +177,4 @@ subprocess.run(['gtt-genbank-to-AA-seqs', '-i', str(bins/'sample.gbk'), '-o', st
 
 if __name__ == '__main__':
     unittest.main()
+
