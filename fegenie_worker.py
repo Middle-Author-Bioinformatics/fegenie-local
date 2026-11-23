@@ -44,12 +44,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import gzip
 import json
 import logging
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -291,10 +293,49 @@ def prepare_bins(job_dir: Path, bins_dir: Path) -> tuple[str, list[Path]]:
     return bin_ext, normalized
 
 
+class MissingGenBankHelper(RuntimeError):
+    pass
+
+
+def check_genbank_helper(args, log_handle=None) -> None:
+    """Check PATH inside the same execution environment used for FeGenie."""
+    cmd = shlex.split(args.command_prefix) if args.command_prefix else []
+    cmd += ["python", "-c", "import shutil,sys; sys.exit(0 if shutil.which('gtt-genbank-to-AA-seqs') else 3)"]
+    result = subprocess.run(cmd, stdout=log_handle or subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    if result.returncode == 3:
+        raise MissingGenBankHelper(
+            "The server is missing the GenBank protein-extraction helper "
+            "gtt-genbank-to-AA-seqs. Install GToTree in the FeGenie execution environment."
+        )
+    if result.returncode:
+        raise RuntimeError("Could not check dependencies in the FeGenie execution environment.")
+
+
+def read_status(s3, bucket: str, key: str) -> dict | None:
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+    status = json.loads(response["Body"].read())
+    if not isinstance(status, dict):
+        raise RuntimeError("Invalid job status; refusing to retry.")
+    return status
+
+
+def selected_prefixes(args, s3) -> list[str]:
+    # A targeted run never scans or processes unrelated jobs.
+    if args.job:
+        return [f"fegenie-{args.job}/"]
+    return list_job_prefixes(s3, args.input_bucket)
+
+
 def build_fegenie_command(args, manifest: JobManifest, bins_dir: Path, out_dir: Path, bin_ext: str) -> list[str]:
     cmd: list[str] = []
     if args.command_prefix:
-        cmd.extend(args.command_prefix.split())
+        cmd.extend(shlex.split(args.command_prefix))
     cmd.extend([
         args.fegenie_bin,
         "-bin_dir",
@@ -467,7 +508,7 @@ def maybe_generate_report(args, job_root: Path, out_dir: Path, report_dest: Path
             logging.info("Generating Plotly FeGenie report with: %s", script)
             cmd: list[str] = []
             if args.command_prefix:
-                cmd.extend(args.command_prefix.split())
+                cmd.extend(shlex.split(args.command_prefix))
             # Original fegenie_report.py interface:
             #   python fegenie_report.py FeGenie-heatmap-data.csv -o report.html
             cmd.extend(["python", str(script), str(heatmap_csv), "-o", str(report_dest)])
@@ -517,18 +558,31 @@ def process_job(args, s3, prefix: str) -> None:
     result_prefix = f"fegenie-{slug}/"
     status_key = f"{result_prefix}status.json"
 
-    if s3_key_exists(s3, args.results_bucket, status_key) and not args.force:
+    if args.job and slug != args.job:
+        return
+    if args.retry_failed:
+        status = read_status(s3, args.results_bucket, status_key)
+        if not status or status.get("state") != "failed":
+            raise RuntimeError("--retry-failed requires an existing failed status for the selected job.")
+    elif s3_key_exists(s3, args.results_bucket, status_key) and not args.force:
         logging.info("Skipping %s; result status already exists.", prefix)
         return
 
     manifest_key = find_manifest_key(s3, args.input_bucket, prefix)
     if not manifest_key:
+        if args.job:
+            raise RuntimeError("Selected job has no input manifest in S3. Restore its inputs before retrying.")
         logging.info("Skipping %s; no manifest file found yet.", prefix)
         return
 
     job_root = Path(args.work_root) / f"fegenie-{slug}"
     if job_root.exists():
-        shutil.rmtree(job_root)
+        # Preserve logs, uploaded inputs and partial outputs before a retry.
+        attempts = Path(args.work_root) / "previous_attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        backup = attempts / f"{job_root.name}-{time.time_ns()}"
+        job_root.rename(backup)
+        logging.info("Preserved previous attempt at %s", backup)
     job_dir = job_root / "input"
     bins_dir = job_root / "bins"
     out_dir = job_root / "fegenie_out"
@@ -543,6 +597,7 @@ def process_job(args, s3, prefix: str) -> None:
         {"slug": slug, "state": "running", "started_at": utc_now(), "input_prefix": prefix},
     )
 
+    completed = False
     try:
         download_prefix(s3, args.input_bucket, prefix, job_dir)
         manifest_path = job_dir / Path(manifest_key).name
@@ -553,6 +608,9 @@ def process_job(args, s3, prefix: str) -> None:
             log_handle.write(f"FeGenie worker started {utc_now()}\n")
             log_handle.write(f"Slug: {slug}\n")
             log_handle.write(f"Input files: {[p.name for p in normalized_inputs]}\n")
+            log_handle.flush()
+            if bin_ext == "gbk":
+                check_genbank_helper(args, log_handle)
             cmd = build_fegenie_command(args, manifest, bins_dir, out_dir, bin_ext)
             run_command(cmd, log_handle)
 
@@ -601,6 +659,7 @@ def process_job(args, s3, prefix: str) -> None:
             },
         )
 
+        completed = True
         if args.ses_sender and manifest.submitter_email:
             body = (
                 f"Hi {manifest.submitter_name or 'there'},\n\n"
@@ -609,7 +668,10 @@ def process_job(args, s3, prefix: str) -> None:
                 f"Results URL: {result_url or '(configure --app-url to include this)'}\n\n"
                 "Results are retained according to the S3 lifecycle rule on the results bucket.\n"
             )
-            send_ses_email(args, manifest, "Your FeGenie results are ready", body)
+            try:
+                send_ses_email(args, manifest, "Your FeGenie results are ready", body)
+            except Exception:
+                logging.exception("Results completed, but the notification could not be sent.")
 
         logging.info("Completed job %s -> s3://%s/%s", slug, args.results_bucket, result_prefix)
 
@@ -619,45 +681,76 @@ def process_job(args, s3, prefix: str) -> None:
             s3,
             args.results_bucket,
             status_key,
-            {"slug": slug, "state": "failed", "failed_at": utc_now(), "error": str(e)},
+            {
+                "slug": slug, "state": "failed", "failed_at": utc_now(),
+                "error_code": "missing_genbank_helper" if isinstance(e, MissingGenBankHelper) else "analysis_failed",
+                "message": (
+                    "The server is missing a dependency for GenBank inputs. Contact MAB with your result code."
+                    if isinstance(e, MissingGenBankHelper)
+                    else "The analysis failed. Contact MAB with your result code."
+                ),
+            },
         )
-        if log_path.exists():
-            upload_file(s3, args.results_bucket, f"{result_prefix}run.log", log_path, "text/plain")
+        # Keep the detailed exception private; the browser receives a safe message.
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\nWorker failure: {e}\n")
         try:
             manifest = parse_manifest(job_dir / Path(manifest_key).name, fallback_slug=slug)
             send_ses_email(
                 args,
                 manifest,
                 "FeGenie job failed",
-                f"FeGenie job {slug} failed.\n\nError:\n{e}\n\nCheck s3://{args.results_bucket}/{result_prefix}run.log",
+                f"Your FeGenie analysis failed. Contact MAB with result code {slug}.",
             )
         except Exception:
             logging.exception("Unable to send failure notification.")
-        if not args.continue_on_error:
+        if args.job or not args.continue_on_error:
             raise
     finally:
-        if args.clean and job_root.exists():
+        if args.clean and completed and job_root.exists():
             shutil.rmtree(job_root)
 
 
 def acquire_lock(lock_path: Path):
+    """Use an OS lock so a stale PID file cannot block future work."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    # Respect an older worker that uses PID/O_EXCL locking during rollout.
+    handle.seek(0)
+    old_pid = handle.read().strip()
+    if old_pid.isdigit():
+        try:
+            os.kill(int(old_pid), 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            handle.close()
+            raise RuntimeError("A worker already owns this lock.")
+        else:
+            handle.close()
+            raise RuntimeError("A worker already owns this lock.")
     try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-    except FileExistsError:
-        raise RuntimeError(f"Lock already exists: {lock_path}")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"Worker already running (lock: {lock_path})")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
-def release_lock(lock_path: Path):
-    try:
-        lock_path.unlink()
-    except FileNotFoundError:
-        pass
+def release_lock(handle):
+    handle.seek(0)
+    handle.truncate()
+    handle.flush()
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+    # Retain the inode: unlinking it can let another process bypass this lock.
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Poll S3 for FeGenie jobs, run FeGenie, and publish frontend-ready results.")
     parser.add_argument("--input-bucket", default=os.getenv("FEGENIE_INPUT_BUCKET", "midauthorbio-fegenie-input"))
     parser.add_argument("--results-bucket", default=os.getenv("FEGENIE_RESULTS_BUCKET", "midauthorbio-fegenie-results"))
@@ -671,30 +764,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ses-bcc", default=os.getenv("FEGENIE_SES_BCC", ""))
     parser.add_argument("--once", action="store_true", help="Run one scan and exit.")
     parser.add_argument("--interval", type=int, default=300, help="Polling interval seconds when not using --once.")
-    parser.add_argument("--force", action="store_true", help="Reprocess jobs even if result status.json exists.")
+    parser.add_argument("--job", help="Process one result code only, without scanning the queue.")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry only the selected job, and only if its status is failed.")
+    parser.add_argument("--force", action="store_true", help="Reprocess the selected job even if status.json exists. Requires --job.")
+    parser.add_argument("--check-dependencies", action="store_true", help="Check the GenBank helper in the FeGenie environment, then exit without AWS access.")
     parser.add_argument("--clean", action="store_true", help="Delete local work directory after each job.")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue polling other jobs after a failure.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--lock-file", default=os.getenv("FEGENIE_LOCK_FILE", "/tmp/fegenie-worker.lock"))
     parser.add_argument("--log-file", default=os.getenv("FEGENIE_WORKER_LOG", "/tmp/fegenie-worker.log"))
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.job and not re.fullmatch(r"[A-Za-z0-9]{1,64}", args.job):
+        parser.error("--job must be an alphanumeric result code.")
+    if (args.force or args.retry_failed) and not args.job:
+        parser.error("--force and --retry-failed require --job.")
+    if args.force and args.retry_failed:
+        parser.error("Choose --force or --retry-failed.")
+    if args.job:
+        args.once = True
+    return args
 
 
 def main() -> int:
     args = parse_args()
     configure_logging(Path(args.log_file), verbose=args.verbose)
+    if args.check_dependencies:
+        check_genbank_helper(args)
+        logging.info("GenBank dependency check passed.")
+        return 0
     lock_path = Path(args.lock_file)
 
     try:
-        acquire_lock(lock_path)
+        lock_handle = acquire_lock(lock_path)
     except RuntimeError as e:
         logging.warning("%s", e)
-        return 0
+        return 1 if args.job else 0
 
-    s3 = make_s3(args.region)
     try:
+        s3 = make_s3(args.region)
         while True:
-            prefixes = list_job_prefixes(s3, args.input_bucket)
+            prefixes = selected_prefixes(args, s3)
             logging.info("Found %d FeGenie job prefix(es).", len(prefixes))
             for prefix in prefixes:
                 process_job(args, s3, prefix)
@@ -702,7 +811,7 @@ def main() -> int:
                 break
             time.sleep(args.interval)
     finally:
-        release_lock(lock_path)
+        release_lock(lock_handle)
     return 0
 
 
