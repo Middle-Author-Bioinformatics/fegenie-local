@@ -297,19 +297,31 @@ class MissingGenBankHelper(RuntimeError):
     pass
 
 
-def check_genbank_helper(args, log_handle=None) -> None:
-    """Check PATH inside the same execution environment used for FeGenie."""
+def runtime_command(args) -> list[str]:
+    """Launch the preparation layer after activation of the execution environment."""
     cmd = shlex.split(args.command_prefix) if args.command_prefix else []
-    cmd += ["python", "-c", "import shutil,sys; sys.exit(0 if shutil.which('gtt-genbank-to-AA-seqs') else 3)"]
+    cmd += ["python", str(Path(__file__).resolve().with_name('fegenie_runtime.py')),
+            "--fegenie-bin", args.fegenie_bin]
+    if args.hmm_dir:
+        cmd += ['--hmm-dir', args.hmm_dir]
+    if args.rscripts_dir:
+        cmd += ['--rscripts-dir', args.rscripts_dir]
+    return cmd
+
+
+def check_genbank_helper(args, log_handle=None) -> None:
+    """Check resources and dependencies in the actual execution environment."""
+    cmd = runtime_command(args) + ['--check-dependencies']
     result = subprocess.run(cmd, stdout=log_handle or subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     if result.returncode == 3:
         raise MissingGenBankHelper(
-            "The server is missing the GenBank protein-extraction helper "
-            "gtt-genbank-to-AA-seqs. Install GToTree in the FeGenie execution environment."
+            "The server is missing a GenBank dependency. Install GToTree and "
+            "Biopython in the FeGenie execution environment."
         )
     if result.returncode:
-        raise RuntimeError("Could not check dependencies in the FeGenie execution environment.")
+        detail = result.stdout.strip() if not log_handle and result.stdout else ''
+        raise RuntimeError("FeGenie resource/dependency check failed. " + detail)
 
 
 def read_status(s3, bucket: str, key: str) -> dict | None:
@@ -333,11 +345,9 @@ def selected_prefixes(args, s3) -> list[str]:
 
 
 def build_fegenie_command(args, manifest: JobManifest, bins_dir: Path, out_dir: Path, bin_ext: str) -> list[str]:
-    cmd: list[str] = []
-    if args.command_prefix:
-        cmd.extend(shlex.split(args.command_prefix))
+    cmd = runtime_command(args)
     cmd.extend([
-        args.fegenie_bin,
+        "--",
         "-bin_dir",
         str(bins_dir),
         "-bin_ext",
@@ -757,6 +767,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-2"))
     parser.add_argument("--work-root", default=os.getenv("FEGENIE_WORK_ROOT", "/tmp/fegenie-worker"))
     parser.add_argument("--fegenie-bin", default=os.getenv("FEGENIE_BIN", "FeGenie.py"))
+    parser.add_argument("--hmm-dir", default=os.getenv("FEGENIE_HMM_DIR", ""), help="Optional HMM directory; defaults to hmms/iron beside FeGenie.py.")
+    parser.add_argument("--rscripts-dir", default=os.getenv("FEGENIE_RSCRIPT_DIR", ""), help="Optional R-script directory; defaults to rscripts beside FeGenie.py.")
     parser.add_argument("--command-prefix", default=os.getenv("FEGENIE_COMMAND_PREFIX", ""), help='Optional prefix, e.g. "conda run -n fegenie"')
     parser.add_argument("--report-script", default=os.getenv("FEGENIE_REPORT_SCRIPT", ""), help="Optional legacy fegenie_report.py path.")
     parser.add_argument("--app-url", default=os.getenv("FEGENIE_APP_URL", ""), help="Amplify app base URL for optional notifications.")
@@ -767,7 +779,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--job", help="Process one result code only, without scanning the queue.")
     parser.add_argument("--retry-failed", action="store_true", help="Retry only the selected job, and only if its status is failed.")
     parser.add_argument("--force", action="store_true", help="Reprocess the selected job even if status.json exists. Requires --job.")
-    parser.add_argument("--check-dependencies", action="store_true", help="Check the GenBank helper in the FeGenie environment, then exit without AWS access.")
+    parser.add_argument("--check-dependencies", action="store_true", help="Check resources and GenBank dependencies in the FeGenie environment, then exit without AWS access.")
     parser.add_argument("--clean", action="store_true", help="Delete local work directory after each job.")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue polling other jobs after a failure.")
     parser.add_argument("--verbose", action="store_true")
@@ -790,7 +802,7 @@ def main() -> int:
     configure_logging(Path(args.log_file), verbose=args.verbose)
     if args.check_dependencies:
         check_genbank_helper(args)
-        logging.info("GenBank dependency check passed.")
+        logging.info("FeGenie resource and GenBank dependency check passed.")
         return 0
     lock_path = Path(args.lock_file)
 
@@ -817,3 +829,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
